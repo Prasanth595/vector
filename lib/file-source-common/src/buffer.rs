@@ -46,7 +46,9 @@ pub async fn read_until_with_max_size<'a, R: AsyncBufRead + ?Sized + Unpin>(
     max_size: usize,
 ) -> io::Result<ReadResult> {
     let mut total_read = 0;
-    let mut discarding = false;
+    // `buf` only stays over the limit when an earlier call reached EOF inside a line it already
+    // reported, so keep discarding that line rather than reporting it again.
+    let mut discarding = buf.len() > max_size;
     let delim_finder = Finder::new(delim);
     let delim_len = delim.len();
     let mut discarded_for_size_and_truncated = Vec::new();
@@ -62,6 +64,14 @@ pub async fn read_until_with_max_size<'a, R: AsyncBufRead + ?Sized + Unpin>(
         let available: &[u8] = match reader.fill_buf().await {
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // Hand back a discard found earlier in this call, because the next call treats an
+            // over-limit `buf` as already reported. A lasting error comes back on that call.
+            Err(_) if !discarded_for_size_and_truncated.is_empty() => {
+                return Ok(ReadResult {
+                    successfully_read: None,
+                    discarded_for_size_and_truncated,
+                });
+            }
             Err(e) => return Err(e),
         };
 
@@ -213,11 +223,18 @@ pub async fn read_until_with_max_size<'a, R: AsyncBufRead + ?Sized + Unpin>(
 
 #[cfg(test)]
 mod test {
-    use std::{io::Cursor, num::NonZeroU8, ops::Range};
+    use std::{
+        collections::VecDeque,
+        io::{self, Cursor},
+        num::NonZeroU8,
+        ops::Range,
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     use bytes::{BufMut, BytesMut};
     use quickcheck::{QuickCheck, TestResult};
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
 
     use super::read_until_with_max_size;
     use crate::buffer::ReadResult;
@@ -447,6 +464,130 @@ mod test {
                 "Should find delimiter for line {i}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_oversized_line_spanning_eof_is_reported_once() {
+        async fn read(
+            data: &[u8],
+            position: &mut u64,
+            buffer: &mut BytesMut,
+            max_size: usize,
+        ) -> ReadResult {
+            let mut reader = BufReader::new(Cursor::new(data.to_vec()));
+            read_until_with_max_size(&mut reader, position, b"\n", buffer, max_size)
+                .await
+                .unwrap()
+        }
+
+        let max_size = 5;
+        let mut position = 0;
+        let mut buffer = BytesMut::new();
+
+        // The first read reaches EOF inside a line that is already over the limit.
+        let result = read(b"0123456789", &mut position, &mut buffer, max_size).await;
+        assert_eq!(result.successfully_read, None);
+        assert_eq!(result.discarded_for_size_and_truncated.len(), 1);
+        let buffered = buffer.len();
+
+        // Polling at EOF does not report it again.
+        let result = read(b"", &mut position, &mut buffer, max_size).await;
+        assert_eq!(result.successfully_read, None);
+        assert!(result.discarded_for_size_and_truncated.is_empty());
+
+        // More of the same line is neither reported nor buffered.
+        let result = read(b"abcdef", &mut position, &mut buffer, max_size).await;
+        assert_eq!(result.successfully_read, None);
+        assert!(result.discarded_for_size_and_truncated.is_empty());
+        assert_eq!(buffer.len(), buffered);
+
+        // The delimiter ends the discarded line, and the next line is read normally.
+        let result = read(b"gh\nnext\n", &mut position, &mut buffer, max_size).await;
+        assert_eq!(result.successfully_read, Some(8));
+        assert!(result.discarded_for_size_and_truncated.is_empty());
+        assert_eq!(buffer.as_ref(), b"next");
+        assert_eq!(position, 24);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_line_is_reported_when_read_error_follows() {
+        struct ScriptedReader {
+            steps: VecDeque<io::Result<Vec<u8>>>,
+            current: Vec<u8>,
+        }
+
+        impl AsyncRead for ScriptedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                unreachable!("only the buffered interface is used")
+            }
+        }
+
+        impl AsyncBufRead for ScriptedReader {
+            fn poll_fill_buf(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+                let this = self.get_mut();
+                if this.current.is_empty()
+                    && let Some(step) = this.steps.pop_front()
+                {
+                    match step {
+                        Ok(data) => this.current = data,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
+                }
+                Poll::Ready(Ok(&this.current))
+            }
+
+            fn consume(self: Pin<&mut Self>, amt: usize) {
+                self.get_mut().current.drain(..amt);
+            }
+        }
+
+        let mut reader = ScriptedReader {
+            steps: VecDeque::from([
+                Err(io::Error::other("before any data")),
+                Ok(b"0123456789".to_vec()),
+                Err(io::Error::other("after the limit")),
+                Ok(b"abc".to_vec()),
+                Err(io::Error::other("after the report")),
+                Ok(b"def\nnext\n".to_vec()),
+            ]),
+            current: Vec::new(),
+        };
+        let max_size = 5;
+        let mut position = 0;
+        let mut buffer = BytesMut::new();
+
+        // An error with nothing to report is returned as usual.
+        let result =
+            read_until_with_max_size(&mut reader, &mut position, b"\n", &mut buffer, max_size)
+                .await;
+        assert!(result.is_err());
+
+        // An error after crossing the limit does not lose the report.
+        let result =
+            read_until_with_max_size(&mut reader, &mut position, b"\n", &mut buffer, max_size)
+                .await
+                .unwrap();
+        assert_eq!(result.successfully_read, None);
+        assert_eq!(result.discarded_for_size_and_truncated.len(), 1);
+
+        // An error after the report is returned, and the line is not reported again.
+        let result =
+            read_until_with_max_size(&mut reader, &mut position, b"\n", &mut buffer, max_size)
+                .await;
+        assert!(result.is_err());
+
+        // Reading recovers and the line after the discarded one is returned.
+        let result =
+            read_until_with_max_size(&mut reader, &mut position, b"\n", &mut buffer, max_size)
+                .await
+                .unwrap();
+        assert_eq!(result.successfully_read, Some(9));
+        assert!(result.discarded_for_size_and_truncated.is_empty());
+        assert_eq!(buffer.as_ref(), b"next");
     }
 
     #[tokio::test]
